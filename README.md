@@ -7,5 +7,5 @@ Format input files similarly to csv's in Example_Inputs, write their paths into 
 Example inputs contain both 3z and 26z systems for timing purposes.
 26z system has 17 unique solutions, copied to 200 rows to test performance.
 
-Please email ml6802@princeton.edu with any questions.
+Please email ml6802@princeton.edu with any questions on adapting GenX MGA cases for MGCA use and evaluation.
 

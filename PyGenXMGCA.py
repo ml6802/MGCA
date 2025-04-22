@@ -3,33 +3,19 @@ import scipy.spatial as sp
 import pandas as pd
 import itertools as it
 import cvxpy as cp
-from dash import Dash, html
-from dash import dcc, callback
-from dash.dependencies import Input, Output, State
-import plotly.express as px
-import plotly.graph_objects as go
-import plotly.subplots as sb
 import time
 import os as os
+
+
+"""
+Utilities: Basic functions for data manipulation
+"""
 
 
 def read_csv():
     input = "C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\Compiled_OutputsMGCADemoAllZ.csv"
     in_df = pd.read_csv(input)
     return in_df
-
-def find_verts(points):
-    (nit, ntt) = points.shape
-    pairs = it.combinations(np.arange(0,ntt,1),2)
-    pairwise_caps = np.empty((nit,2))
-    verts = np.empty((0,ntt))
-    for comb in pairs:
-        pairwise_caps[:,0] = points[:,comb[0]]
-        pairwise_caps[:,1] = points[:,comb[1]]
-        hull = sp.ConvexHull(pairwise_caps,qhull_options='QJ')
-        verts = np.append(verts,points[hull.vertices,:],axis = 0)
-    verts = unique_rows(verts)
-    return verts
         
 def unique_rows(points):
     y = np.ascontiguousarray(points).view(np.dtype((np.void, points.dtype.itemsize * points.shape[1])))
@@ -37,6 +23,47 @@ def unique_rows(points):
 
     unique_result = points[idx]
     return unique_result
+
+def display_and_write(vector, names):
+    df = pd.DataFrame(columns=names)
+    for i in range(len(vector)):
+        df.loc[i] = vector[i]
+    return df
+
+def check_duplicate_weights(ws, all_weights):
+    for weight in all_weights:
+            if all(x == y for x, y in zip(ws, weight)):  
+                return False
+    
+    return True
+
+def remove_metrics(df, no_zones):
+    for col in df.columns:
+        name = col.split('_')
+        if no_zones ==True and name[-1].isnumeric():
+            df = df.drop(col,axis=1)
+        elif no_zones ==False and not name[-1].isnumeric():
+            df = df.drop(col, axis =1)
+        elif 'cost' in col or 'emissions' in col or 'transmission' in col or 'Total' in col:
+            df = df.drop([col], axis=1)
+
+    return df
+
+def find_indices(df, strings):
+    indices = []
+    for s in strings:
+        indices.append(df.columns.get_loc(s))
+    return indices
+
+def adjust_metrics(df, objective_indices):
+    for col in df.columns[objective_indices]:
+        df[col] = df[col]*1e6
+    return df
+
+
+"""
+Core Functions: Usable in many circomstances
+"""
 
 def generate_point(points,weights):
     #(nits_inds, nsol_inds) = inds.shape
@@ -50,28 +77,6 @@ def generate_point(points,weights):
 
         generated_points[j,:] = sum(weights[j,i]*points[inds[i],:] for i in np.arange(0,nsol,1))
     return generated_points
-
-def check_unique_interp(prev_pts, new_pts):
-    (n_new, nvar)=new_pts.shape
-    (n_old, nvar2) = prev_pts.shape
-    unique_old = unique_rows(prev_pts)
-    tot_points = np.append(prev_pts,new_pts,axis = 0)
-    for i in np.arange(n_old,n_old+n_new,1):
-        tot_points[i,-1] = i
-        new_pts[i-n_old,-1] = i
-    unique_new = unique_rows(tot_points)
-    print(unique_old.shape)
-    print(unique_new.shape)
-    return unique_new, new_pts
-
-"""
-Check Min Max function description:
-    Inputs: Technology of Choice and Capacity Value Selected
-        Dictionary: <"Tech": names from input; "Capacity": 300 >
-        
-    Outputs: Min/Max values of other technologies within convex hull at that point
-    Should be able to select multiple.
-"""
 
 def check_minmax(points, select):
     npoints, ntech = points.shape
@@ -117,13 +122,6 @@ def check_minmax(points, select):
 
     return xminmax
 
-"""
-create_feasibility_problem function description:
-    Inputs: points in proper format (array)
-        
-    Outputs: feasibility problem as cvxpy problem
-"""
-
 def create_feasibility_problem(points):
     npoints, ntech = points.shape
     l = cp.Variable(npoints, nonneg=True)
@@ -134,45 +132,74 @@ def create_feasibility_problem(points):
     ]
     cost_sens_obj = cp.Minimize(x[0]) #placeholder obj min cost
     feas_problem = cp.Problem(cost_sens_obj,constraints)
-    feas_problem.solve(solver="GLPK_MI")
-    return feas_problem, x
+    return feas_problem, x, l
 
-"""
-add_eq_constraint function description:
-    Inputs: weights: A_matrix, right hand side: b_vector, feas_problem: feasibility problem, x: variables from feasibility problem
-        
-    Outputs: feasibility problem as cvxpy problem with new set of equality constraints
-"""
-
-def add_eq_constraint(weights, rhs, feas_problem,x):
+def add_eq_constraint(weights, rhs, feas_problem,x, l,vert_arr,buffer):
     new_constraint = [
         weights@x == rhs
     ]
-    new_prob = cp.Problem(feas_problem.objective, feas_problem.constraints + new_constraint)
+    zl_constraint = create_zero_lambda_constraint(vert_arr, rhs, weights, buffer, l, True)
+    new_prob = cp.Problem(feas_problem.objective, feas_problem.constraints + new_constraint + zl_constraint)
     return new_prob, x
 
-"""
-add_ineq_constraint function description:
-    Inputs: weights: A_matrix, right hand side: b_vector, feas_problem: feasibility problem, x: variables from feasibility problem
-        
-    Outputs: feasibility problem as cvxpy problem with new set of inequality constraints <= rhs
-"""
-
-def add_ineq_constraint(weights, rhs, feas_problem,x):
+def add_ineq_constraint(weights, rhs, feas_problem,x,l,vert_arr,buffer):
     new_constraint = [
         weights@x <= rhs
     ]
-    new_prob = cp.Problem(feas_problem.objective, feas_problem.constraints + new_constraint)
+    zl_constraint = create_zero_lambda_constraint(vert_arr, rhs, weights, buffer, l, False)
+    new_prob = cp.Problem(feas_problem.objective, feas_problem.constraints + new_constraint + zl_constraint)
     return new_prob, x
 
-"""
-    create_pareto_front function description:
-    Inputs: objectives: set of objective indices, feas_problem: feasibility problem, x: variables from feasibility problem
+def evaluate_metric(weights, vert_arr):
+    (r,c) = vert_arr.shape
+    metric_eval = vert_arr@weights
+    metric_eval = metric_eval.reshape((r,1))
+    return metric_eval
+
+def evaluate_residual(metric_eval, rhs):
+    return metric_eval - rhs
+
+def select_points_from_metric_inequality(metric_eval, rhs, buffer):    # Buffer should be a list of length 1 for adding an inequality
+    indices = np.array([x for x in range(len(metric_eval))]).reshape((len(metric_eval),1))
+    sorted_indices = indices[metric_eval[:,0].argsort()]
+    sorted_metrics = metric_eval[metric_eval[:,0].argsort()]
+    selected = np.ones(len(metric_eval))
+    counter = 0
+    for i in range(len(metric_eval)):
+        if sorted_metrics[i][0] <= rhs:
+            selected[sorted_indices[i]] = 0
+        elif sorted_metrics[i][0] > rhs and counter < buffer:
+            selected[sorted_indices[i]] = 0
+            counter += 1
+        else:
+            break
+    
+    return selected
+
+def select_points_from_metric_equality(metric_eval, rhs, lim_minus, lim_plus):  
+    residual = evaluate_residual(metric_eval, rhs)
+    indices = np.array([x for x in range(len(residual))]).reshape((len(residual),1))
+    sorted_indices = indices[residual[:,0].argsort()]
+    sorted_metrics = residual[residual[:,0].argsort()]
+    selected = np.ones(len(residual))
+    for i in range(len(metric_eval)):
+        if sorted_metrics[i] <= lim_plus and sorted_metrics[i] >= lim_minus:
+            selected[sorted_indices[i]] = 0
+    return selected
+
+
+
+def create_zero_lambda_constraint(vert_arr, rhs, weights, buffer, l, equality):   # Buffer should be a list of length 2 for adding an equality, length 1 for an inequality. For inequality, should be format [Lim_minus, Lim_plus], for equality [Buffer number] 
+    metric_eval = evaluate_metric(weights, vert_arr)
+    if equality == False:
+        selected = select_points_from_metric_inequality(metric_eval, rhs, buffer[0])
+    elif equality == True:
+        selected = select_points_from_metric_equality(metric_eval, rhs, buffer[0], buffer[1])
+    constraint = [
+        cp.sum(selected@l) == 0
+    ]
+    return constraint
         
-    Outputs: list of resulting pareto frontier. Each sub-list is new solution, each column is variable
-"""
-
-
 def create_pareto_front(objs, feas_problem, x):
     nobjs, nvars = objs.shape
     x_output = []
@@ -195,67 +222,69 @@ def create_pareto_front(objs, feas_problem, x):
         x_output.append(x.value)
     return x_output
 
-"""
-    test_add_constraint function description:
-    Inputs: vert_arr: initial points, objective_indices: column numbers for objectives
-        
-    Outputs: list of solutions exploring newly constrained space.
-"""
 
-def test_add_constraint(vert_arr, objective_indices):
-    (r,c) = vert_arr.shape
-    feas_prob, x = create_feasibility_problem(vert_arr)
-    cons_vec = np.zeros(c)
-    cons_vec[8] = 1.0 #onshore wind
-    rhs = 1500
-    cons_prob, x = add_ineq_constraint(cons_vec, rhs, feas_prob, x)
-    results = conduct_mga_search(cons_prob, x, c, 200, objective_indices)
-    objs = np.zeros((2,c))
-    objs[0,objective_indices[0]] = 1 #min cost
-    objs[1,objective_indices[1]] = 1 # min emissions
-    pareto = create_pareto_front(objs, cons_prob, x)
-    for i in pareto:
-        results.append(i)
-
-    return results
-
-"""
-    conduct_mga_search function description:
-    conducts a search of the space both finding max and min for each variable plus randomized combinations of those variables.
-
-    Inputs: feas_prob: feasibility problem, x: variables from feasibility problem, nvar: number of variables, 
-        its: desired iterations,objective_indices: column numbers for objectives
-        
-    Outputs: list of solutions exploring newly constrained space.
-"""
-
-def conduct_mga_search(feas_prob,x, nvar, its, objective_indices):
-    objectives = np.random.randint(-1,1,(nvar,its)) # var min max method
+def conduct_mga_search(feas_prob,x, l, nvar, its, viable_indices):
+    objectives = np.random.randint(-1,1,(nvar,int(np.ceil(its/2))))*1000 #np.random.random((nvar,its))*1000*np.random.choice([-1,1])      # # var min max method
     constraints = feas_prob.constraints
+    objectives = np.concatenate((objectives, -objectives), axis=1)
     results =[]
-    for i in range(0,nvar):
-        lc_obj= cp.Minimize(x[i])
-        lc_problem = cp.Problem(lc_obj,constraints)
-        lc_problem.solve(solver="GLPK_MI")
-        solution = x.value
-        results.append(solution)
-        lc_obj= cp.Maximize(x[i])
-        lc_problem = cp.Problem(lc_obj,constraints)
-        lc_problem.solve(solver="GLPK_MI")
-        solution = x.value
-        results.append(solution)
+    weights = []
+
+    if len(viable_indices) < 100:
+        for i in viable_indices:
+            lc_obj= cp.Minimize(x[i])
+            lc_problem = cp.Problem(lc_obj,constraints)
+            results, weights = solve_problem(lc_problem,x,l, results, weights)
+
+            lc_obj= cp.Maximize(x[i])
+            lc_problem = cp.Problem(lc_obj,constraints)
+            results, weights = solve_problem(lc_problem,x,l, results, weights)
+
+    
     
     for i in range(0,its):
         mga_obj = cp.Minimize(objectives[:,i]@x)
         mga_problem = cp.Problem(mga_obj,constraints)
         mga_problem.solve(solver="GLPK_MI")
         if mga_problem.status == cp.OPTIMAL:
-            solution = x.value
-            results.append(solution)
+            results.append(x.value)
+            weights.append(l.value) 
         else: 
-            print("ERROR")
-            break 
-    return results
+            print("ERROR") 
+    return results, weights
+
+
+"""
+Tests: Test functions for the core example functionalities
+"""
+
+def test_xminmax():
+    output_path = "C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\Raw_Data\\Compiled_Outputs_Interp_py.csv"
+    input = read_csv()
+    names = list(input.columns)
+    input_arr = input.to_numpy()
+    vert_arr = input_arr
+    vert_arr = vert_arr[vert_arr[:,-1].argsort()]
+    vert_df = pd.DataFrame(vert_arr, columns = names)
+    selected = np.array([])#v[1,8000],[5,10000]
+    xminmax = check_minmax(vert_arr[:,:-1],selected)
+    xminmax_df = pd.DataFrame(xminmax,columns = names[:-1])
+    print(xminmax_df)
+    return
+
+def test_add_constraint(vert_arr,viable_indices, cons_vec,rhs, equality):
+    (r,c) = vert_arr.shape
+    feas_prob, x,l = create_feasibility_problem(vert_arr)
+    if equality == False:
+        buffer = [20]
+        cons_prob, x = add_ineq_constraint(cons_vec, rhs, feas_prob, x, l, vert_arr, buffer)
+    elif equality == True:
+        buffer = [-0.02*rhs, 0.012*rhs]
+        cons_prob, x = add_eq_constraint(cons_vec, rhs, feas_prob, x, l, vert_arr, buffer)
+    results, weights = conduct_mga_search(cons_prob, x, l, c, 200, viable_indices)
+
+    return results, weights
+
     
 def test_pareto_front(vert_arr, objective_indices):
     (nit, nvar) = vert_arr.shape
@@ -267,193 +296,165 @@ def test_pareto_front(vert_arr, objective_indices):
     pareto = create_pareto_front(objs, feas_prob, x)
     return pareto
 
-def test_feas_prob():
-    # Read Inputs
-    input = pd.read_csv("C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\Compiled_OutputsMGCADemoAllZ.csv")
-    input2 = pd.read_csv("C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\Compiled_OutputsFinal3z.csv")
-    output_path = "C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\"
-    input_arr = input2.to_numpy()
-    (npoints,nvars) = input_arr.shape
-    
-    feas_prob, x = create_feasibility_problem(input_arr)
-    obj = cp.Minimize(x[4])
-    prob = cp.Problem(obj, feas_prob.constraints)
-    t1 = time.time()
-    prob.solve(solver = "GLPK_MI")
-    t2 = time.time() - t1
-    print(t2)
-    new_point = x.value
-    new_point = new_point.reshape(1,len(new_point))
-
-    names = list(input2.columns)
-    
-    output_df = pd.DataFrame(new_point, columns=names)
-    print(output_df)
-    output_df.to_csv(os.path.join(output_path,"FeasProb.csv"))
-
-
-
-def test_set_metric(vert_arr, metric_cap,objective_indices,metric_index):
+def test_set_metric(vert_arr, metric_cap,viable_indices,metric_index, equality):
     (r,c) = vert_arr.shape
-    feas_prob, x = create_feasibility_problem(vert_arr)
+    feas_prob, x,l = create_feasibility_problem(vert_arr)
     cons_vec = np.zeros(c)
     cons_vec[metric_index] = 1.0 
     rhs = metric_cap
-    cons_prob, x = add_eq_constraint(cons_vec, rhs, feas_prob, x)
-    results = conduct_mga_search(cons_prob, x, c, 200, objective_indices)
-    return results
+    if equality == False:
+        buffer = [20]
+        cons_prob, x = add_ineq_constraint(cons_vec, rhs, feas_prob, x, l, vert_arr, buffer)
+    elif equality == True:
+        buffer = [-0.012*rhs, 0.012*rhs]
+        cons_prob, x = add_eq_constraint(cons_vec, rhs, feas_prob, x, l, vert_arr, buffer)
+    results, weights = conduct_mga_search(cons_prob, x, l, c, 200, viable_indices)
 
-def return_interpolate_vec(point):
-    vector = np.zeros(len(point))
-    mag = np.linalg.norm(point)
-    for i in range(0,len(point)):
-        vector[i] = point[i]/mag
-    return vector
+    return results, weights
+    
 
-def display_and_write(vector, names):
-    df = pd.DataFrame(columns=names)
-    for i in range(len(vector)):
-        df.loc[i] = vector[i]
-    return df
+def test_set_budget(vert_arr, metric_cap,viable_indices,metric_index, equality):
+    (r,c) = vert_arr.shape
+    feas_prob, x,l = create_feasibility_problem(vert_arr)
+    cons_vec = np.zeros(c)
+    cons_vec[metric_index] = 1.0 
+    rhs = metric_cap
+    if equality == False:
+        buffer = [20]
+        cons_prob, x = add_ineq_constraint(cons_vec, rhs, feas_prob, x, l, vert_arr, buffer)
+        results, weights = conduct_mga_search(cons_prob, x, l, c, 200, viable_indices)
+    elif equality == True:
+        buffer = [-0.012*rhs, 0.012*rhs]
+        cons_prob, x = add_eq_constraint(cons_vec, rhs, feas_prob, x, l, vert_arr, buffer)
+        results, weights = conduct_mga_search(cons_prob, x, l, c, 200, viable_indices)
+
+
+    return results, weights 
+
+    
+def test_pareto_front(vert_arr, objective_indices):
+    (nit, nvar) = vert_arr.shape
+    feas_prob, x, l= create_feasibility_problem(vert_arr)
+    
+    objs = np.zeros((2,nvar))
+    objs[0,objective_indices[0]] = 1 #min cost
+    objs[1,objective_indices[1]] = 1 # min emissions
+    pareto = create_pareto_front(objs, feas_prob, x)
+    return pareto
 
 """
-tests() function definition:
-
-loads from path, tests main mgca functionalities including:
-    set budget interpolation at 5% - essentially adding an equality constraint
-    adding custom inequality constraint
-    running pareto frontier between system level cost and emissions
-    set emissions interpolation at 70% of least cost emissions
-
-writes csvs for each of these operations for later analysis and visualization
-
+Running Functions: Functions which run many tests
 """
 
 def tests():
-    output_path = "C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\"
-    input = pd.read_csv("C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\Compiled_OutputsFinal3z.csv")
-    names = list(input.columns)
-    vert_arr = input.to_numpy()
-    vert_df = pd.DataFrame(vert_arr, columns = names)
-    objective_indices = [13,14] #range(60,68)  MAKE SURE TO ADJUST DEPENDING ON CLUSTERING OF GENERATORS AND METRICS
+    output_path = "" #### Your Path Here 
+    input = pd.read_csv("") #### Your Path Here /MGCA/Example_Inputs/Compiled_OutputsFinal3zAllZnogroup.csv")
+
+    # Initialize column separators
     
-    metric_index = objective_indices[0]
-    metric_cap = vert_arr[0,metric_index]*1.05 # 50% of original budget, which was 10%. Results in 5% budget increase interpolates
-    print(metric_cap)
+    names = list(input.columns)
+
+    objective_indices =[x for x in range(60,68)]# #range(1668,1722)  # OPTIONS: range(1668,1722)#[13,14] #range(60,68)
+    
+    capacity_variables = [i for i in range(len(names))]
+    capacity_variables = list(set([x for x in range(len(names))]) ^ set(objective_indices))
+    for col in input.columns[objective_indices]:
+        input[col] = input[col]/1e6
+    vert_arr = input.to_numpy()
+    (r,c) = vert_arr.shape
+    
+
+    viable_indices = []
+    for col in [names[i] for i in capacity_variables]:
+        if max(input[col]) - min(input[col]) > 1:
+            viable_indices.append(input.columns.get_loc(col))
+
+
+    # Run interpolation tests
+    # Budget Test:
+    metric_indices = objective_indices[0] # 0: cost, 1: emissions ... remaining are zonal cost and emissions (check input csv)
+    metric_cap = vert_arr[0,metric_indices]*1.07 # 70% of original budget, which was 10%. Results in 7% budget increase interpolates
+    equality = False # True for equality, False for inequality
+    print("Metric Cap: ", metric_cap)
     t1 = time.process_time()
-    metric_pts = test_set_metric(vert_arr, metric_cap,objective_indices,metric_index)
+    budget_pts, weights = test_set_budget(vert_arr, metric_cap,viable_indices,metric_indices, equality)
     t_end = time.process_time()-t1
     print(t_end)
+
+    cons_vec = np.zeros(len(names))
+    counter = 0
+
+    ### Note: The following constraints are examples. Uncomment the one you want to use and comment out the others.
+    ## Example constraint onshore wind limit
+    """
+    for name in names:
+        if 'wind' in name and ('onshore' in name or 'land' in name):
+            cons_vec[counter] = 1.0
+        counter += 1
+    rhs = 1500
+    """
+    # Example constraint: nuclear limit
+    """
+    for name in names:
+        if 'nuclear' in name:
+            cons_vec[counter] = 1.0
+        counter += 1
+    rhs = 0.1
+    """
+    equality = False
     t2 = time.process_time()
-    cons = test_add_constraint(vert_arr,objective_indices)
+    cons, weights_cons = test_add_constraint(vert_arr,viable_indices, cons_vec, rhs, equality) ## Adds uncommented constraint and tests
     t_end = time.process_time()-t2
     print(t_end)
-    t3 = time.process_time()
-    pareto = test_pareto_front(vert_arr, objective_indices)
-    t_end = time.process_time()-t3
-    print(t_end)
-    t4 = time.process_time()
+
+
+    # Emissions Test: Sets emissions cap to 70% of original emissions
     metric_index = objective_indices[1]
     metric_cap = vert_arr[0,metric_index]*0.7
-    ems_pts = test_set_metric(vert_arr, metric_cap,objective_indices,metric_index)
+    equality = False
+    t3 = time.process_time()
+    ems_pts, weights_ems = test_set_metric(vert_arr, metric_cap,viable_indices,metric_index, equality)
     t_end = time.process_time()-t3
     print(t_end)
 
-    budget_df = display_and_write(metric_pts, names)
-    budget_df.to_csv(os.path.join(output_path, "BudgetImpose.csv"))
+    # Pareto Test: Generates Pareto front for cost and emissions
+    t_5 = time.process_time()
+    pareto_inds = objective_indices[0:2]
+    pareto = test_pareto_front(vert_arr, pareto_inds)
+    t_end = time.process_time()-t_5
+    print(f"Time = {t_end}")
+    
+    # Writing Outputs ---- uncomment to write to csv
+    budget_df = display_and_write(budget_pts, names)
+    budget_df = adjust_metrics(budget_df, objective_indices)
     print(budget_df)
+    #budget_df.to_csv(os.path.join(output_path, "Budget_TestMin411.csv")) ## Change output name here
+
+    weights_df = display_and_write(weights, [x for x in range(r)])
+    #weights_df.to_csv(os.path.join(output_path, "Budget_weightsMin411.csv"))
 
     fix_ems_df = display_and_write(ems_pts, names)
-    fix_ems_df.to_csv(os.path.join(output_path, "EmsImpose.csv"))
+    fix_ems_df = adjust_metrics(fix_ems_df, objective_indices)
     print(fix_ems_df)
+    #fix_ems_df.to_csv(os.path.join(output_path, "Ems_FixMin411.csv"))
 
+    #fix_ems_df_m_l = display_and_write(ems_pts_m_l, names)
+    #fix_ems_df_m_l.to_csv(os.path.join(output_path, "EmsImpose_Fix329_m_l.csv"))
+    
     par_df = display_and_write(pareto, names)
-    par_df.to_csv(os.path.join(output_path, "Pareto.csv"))
+    par_df = adjust_metrics(par_df, objective_indices)
+    #par_df.to_csv(os.path.join(output_path, "Pareto411.csv"))
+    
     
     cons_df = display_and_write(cons, names)
-    cons_df.to_csv(os.path.join(output_path, "Cons.csv"))
-
+    cons_df = adjust_metrics(cons_df, objective_indices)
+    print(cons_df)
+    #cons_df.to_csv(os.path.join(output_path, "Cons_Fix_NoNucMin411.csv"))
     
 
-def remove_metrics(df, no_zones):
-    for col in df.columns:
-        name = col.split('_')
-        if no_zones ==True and name[-1].isnumeric():
-            df = df.drop(col,axis=1)
-        elif no_zones ==False and not name[-1].isnumeric():
-            df = df.drop(col, axis =1)
-        elif 'cost' in col or 'emissions' in col or 'transmission' in col or 'Total' in col:
-            df = df.drop([col], axis=1)
-
-    return df
-
-def find_indices(df, strings):
-    indices = []
-    for s in strings:
-        indices.append(df.columns.get_loc(s))
-    return indices
-
-
 """
-test_export_multi() function definition:
-
-loads from path, generates a set of random interpolates. Must use generator cluster level inputs for max accuracy
-
-writes csv to allow for exporting solutions to GenX interpolation evaluation operational model.
-
+Run Function Here
 """
 
-def test_export_multi():
-    # Read Inputs
-    input = pd.read_csv("C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\Compiled_OutputsFinal3zAllZnogroup.csv")
-    input2 = pd.read_csv("C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\Compiled_OutputsMGCADemo.csv")
-    output_path = "C:\\Users\\mike_\\OneDrive\\Documents\\PhD\\ZERO_Lab\\MGCA\\CapacityResults\\"
-    input_arr = input.to_numpy()
-    (npoints,nvars) = input_arr.shape
-    
-    # Make Point
-    num_new = 50
-    weights_vals=np.random.rand(num_new,4)
-    weight_indices=np.random.randint(0,npoints,size=(num_new,4))
-    weights = np.zeros((num_new,npoints))
-    for i in range(0,num_new):
-        for j in range(0,4):
-            weights[i,weight_indices[i,j]] = weights_vals[i,j]
 
-    weights_norm = np.zeros(weights.shape)
-    weights_toss = np.zeros(npoints)
-    weights_toss[0] = 1.0
-    for i in range(0,num_new):
-        weights_norm[i,:] = weights[i,:]/np.sum(weights[i,:])
-        if np.sum(weights_norm[i,:]) != 1.0:
-            weights_norm[i,:] = weights_toss
-        print(np.sum(weights_norm[i,:]))
-    t1 = time.time()
-    new_point = generate_point(input_arr,weights_norm)
-    t2 = time.time()-t1
-    print(t2)
-    new_point_df = pd.DataFrame(new_point, columns = input.columns)
-    print(new_point_df)
-
-    no_zones_cap = remove_metrics(new_point_df,True)
-    zones_cap = remove_metrics(new_point_df,False)
-    zones_cap_arr = zones_cap.to_numpy()
-
-    # Create Interpolate Vector
-    vec = 1000*return_interpolate_vec(zones_cap_arr[0])
-
-    
-    names = list(zones_cap.columns)
-    print(names)
-    names2 = list(no_zones_cap.columns)
-    new_point_df.to_csv(os.path.join(output_path, "ExportFullPointMulti.csv"))
-
-
-"""
-Main Running area: select desired function here.
-
-"""
-
-#test_export_multi()
-#test_feas_prob()
 tests()
